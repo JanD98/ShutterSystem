@@ -5,139 +5,237 @@
  * Author: melle
  */ 
 
- #define F_CPU 16E6
+#define F_CPU 16E6
 
- #include <stdbool.h>
- #include <stdint.h>
- #include <stdio.h>
- #include <stdlib.h>
- #include <util/delay.h>
- #include "io/io.h"
- #include "analog/analog.h"
- #include "serial/serialconnection.h"
- #include "helpers.h"
- #include "shutter.h"
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <util/delay.h>
+#include "io/io.h"
+#include "analog/analog.h"
+#include "scheduler/scheduler.h"
+#include "serial/serialconnection.h"
+#include "hcsr04/hcsr04.h"
+#include "storage/eeprom.h"
+#include "helpers.h"
+#include "shutter.h"
 
- #define TMP_PIN 0 // TMP36 pin is on A0
- #define LDR_PIN 1 // LDR pin is on A1
+#define TMP_PIN 0 // TMP36 pin is on A0
+#define LDR_PIN 1 // LDR pin is on A1
 
- // LED's to give the status of the shutter
- #define LEDRED		8
- #define LEDGREEN	9
- #define LEDYELLOW	10
+// LED's to give the status of the shutter
+#define LEDRED			9
+#define LEDGREEN		8
+#define LEDYELLOW		10
 
- // ID's are used for serial communication
- #define TMP36		1
- #define LDR		2
- #define SHUTTER	3
+// ID's are used for serial communication
+#define TMP36			1
+#define LDR				2
+#define SHUTTER			3
 
- float temperatures[MAX_TMP_READINGS];
- uint16_t lightvalues[MAX_LDR_READINGS];
+// message types
+#define MAX_UP_DIST		1
+#define MAX_DOWN_DIST	2
+#define ROLL			3
+#define TMP_UPPER_LIMIT 4
+#define TMP_LOWER_LIMIT 5
+#define LDR_UPPER_LIMIT 6
+#define LDR_LOWER_LIMIT 7
 
- int t = 0;
- int l = 0;
+float temperatures[MAX_TMP_READINGS];
+uint16_t lightvalues[MAX_LDR_READINGS];
 
- enum state shutter_state = UP;
+int t = 0;
+int l = 0;
 
- void initShutter() {
+enum state shutter_state = UP;
+enum state next_state;
+uint8_t PROCESS_ID;
+
+settings shutter_settings;
+
+void loadSettings() {
+	shutter_settings.maxTmp = loadMaxTmp();
+	shutter_settings.minTmp = loadMinTemp();
+	shutter_settings.maxDownDist = loadMaxDownDist();
+	shutter_settings.maxUpDist = loadMaxUpDist();
+	shutter_settings.maxLight = loadMaxLight();
+	shutter_settings.minLight = loadMinLight();
+}
+
+void initShutter() {
 	outputPin(LEDRED);
 	outputPin(LEDGREEN);
 	outputPin(LEDYELLOW);
 	
 	setPin(LEDGREEN, HIGH);
- }
 
- void readTemperature() {
+	loadSettings();
+
+	setSerialUpdateTrigger(controllerInputInterrupt);
+	// initialize HCSR04
+	initHCSR04();
+}
+
+void readTemperature() {
 	uint16_t reading = readADC(TMP_PIN);
 
 	float voltage = (reading * 5.0) / 1024.0;
 	float temperature = (voltage - 0.5) * 100;
 	temperatures[t] = temperature;
 
-	char tmpS[10];
-	dtostrf(temperature, 2, 2, tmpS);
-	printf("tmp: %sC\n", tmpS);
-
 	t = (t >= MAX_TMP_READINGS-1) ? 0 : t + 1;
- }
+}
 
- void readLightValue() {
+void readLightValue() {
 	lightvalues[l] = map(readADC(LDR_PIN), 0, 1023, 0, 100);
 	l = (l >= MAX_LDR_READINGS-1) ? 0 : l + 1;
- }
+}
  
- float calculateAverageTemperature() {
-	 float total = 0.0;
-	 uint8_t validReadings = 0;
+float calculateAverageTemperature() {
+	float total = 0.0;
+	uint8_t validReadings = 0;
 
-	 for (int i = 0; i < MAX_TMP_READINGS; i++) {
+	for (int i = 0; i < MAX_TMP_READINGS; i++) {
 		if(temperatures[i] != 0) validReadings++;
 		total += temperatures[i];
-	 }
+	}
 
-	 return total / validReadings;
- }
+	return total / validReadings;
+}
  
- float calculateAverageLightIntensity() {
-	 float total = 0.0;
-	 uint8_t validReadings = 0;
-	 
-	 for (int i = 0; i < MAX_LDR_READINGS; i++) {
+float calculateAverageLightIntensity() {
+	float total = 0.0;
+	uint8_t validReadings = 0;
+	
+	for (int i = 0; i < MAX_LDR_READINGS; i++) {
 		if(lightvalues[i] != 0) validReadings++;
 		total = total + lightvalues[i];
-	 }
-	 
-	 return total / validReadings;
- }
+	}
+	
+	return total / validReadings;
+}
 
- void sendStatusUpdate() {
+void sendStatusUpdate() {
 	char avgTempS[10];
 	dtostrf(calculateAverageTemperature(), 2, 2, avgTempS);
 	char avgLightS[10];
 	dtostrf(calculateAverageLightIntensity(), 2, 2, avgLightS);
-	printf("%u:%s|%u:%s\n",TMP36, avgTempS, LDR, avgLightS);
- }
+	printf("%u:%s|%u:%s|%u:%u\n",TMP36, avgTempS, LDR, avgLightS, SHUTTER, measureDistance());
+}
 
- // this function runs when a byte is received from controller (python)
- void controllerInputInterrupt(uint8_t byte) {
-	if(byte == DOWN) {
-		printf("rolling down\n");
-		roll(DOWN);
-	} else {
-		printf("rolling up\n");
-		roll(UP);
+// process a given command
+void processMessage(uint8_t msg[2]) {
+	uint8_t id = msg[0];
+	uint8_t val = msg[1];
+	switch(id) {
+		case MAX_UP_DIST:
+			saveMaxUpDist(val);
+			shutter_settings.maxUpDist = val;
+			break;
+		case MAX_DOWN_DIST:
+			saveMaxDownDist(val);
+			shutter_settings.maxDownDist = val;
+			break;
+		case ROLL:
+			val &= 1; // make sure 2th message bit is 0 or 1
+			PROCESS_ID = SCHAddTask(roll, 0, 500);
+			next_state = val;
+			break;
+		case TMP_UPPER_LIMIT:
+			saveMaxTmp(val);
+			shutter_settings.maxTmp = val;
+			break;
+		case TMP_LOWER_LIMIT:
+			saveMinTemp(val);
+			shutter_settings.minTmp = val;
+			break;
+		case LDR_UPPER_LIMIT:
+			saveMaxLight(val);
+			shutter_settings.maxLight = val;
+			break;
+		case LDR_LOWER_LIMIT:
+			saveMinLight(val);
+			shutter_settings.minLight = val;
+			break;
 	}
-	printf("DONE\n");
- }
+}
 
- void roll(enum state s) {
+// this function runs when a byte is received from controller (python)
+void controllerInputInterrupt(uint8_t byte) {
+	static uint8_t bytesread = 0; // keep track of how many bytes we have read already. This is also used as index
+	static uint8_t message[2]; // In here, we store the message
+	// keep reading bytes, till we have 2
+	message[bytesread] = byte;
+	bytesread++;
+	if(bytesread == 2) {
+		processMessage(message);
+		bytesread = 0;
+	}
+}
+
+void toggleYellowLed() {
+	static uint8_t flag = LOW;
+	if(flag == LOW) {
+		setPin(LEDYELLOW, HIGH);
+		flag = HIGH;
+	} else {
+		setPin(LEDYELLOW, LOW);
+		flag = LOW;
+	}
+}
+
+void roll() {
 	// do nothing if it's already in given state or given state is PROGRESS
 	// TODO: make this if statement nicer!
-	if (s == shutter_state || shutter_state == PROGRESS_UP || shutter_state == PROGRESS_DOWN) return;
-	if (s == UP) {
-		// roll up
-		setPin(LEDRED, LOW);
-		shutter_state = PROGRESS_UP;
-		emulateRoll();
-		shutter_state = UP;
-		setPin(LEDGREEN, HIGH);
-	} else if(s == DOWN) {
-		// roll down
-		setPin(LEDGREEN, LOW);
-		shutter_state = PROGRESS_DOWN;
-		emulateRoll();
-		shutter_state = DOWN;
-		setPin(LEDRED, HIGH);
-	}
- }
+	enum state s = next_state;
+	if (!(s == shutter_state)) {
+		uint16_t currentDist;
+		if (s == UP) {
+			// roll up
+			setPin(LEDRED, LOW);
+			shutter_state = PROGRESS_UP;
+			// keep checking the distance, till shutter is up
+			if(shutter_state != s) {
+				toggleYellowLed();
+				currentDist = measureDistance();
+				// check if shutter is rolled up to max distance
+				if(currentDist <= shutter_settings.maxUpDist) {
+					shutter_state = UP;
+					setPin(LEDGREEN, HIGH);
+					setPin(LEDYELLOW, LOW);
+					printf("%u:%u\n", SHUTTER, measureDistance());
+					SCHDeleteTask(PROCESS_ID);
+				}
+			}
+		} else if(s == DOWN) {
+			// roll down
+			setPin(LEDGREEN, LOW);
+			shutter_state = PROGRESS_DOWN;
+			if(shutter_state != s) {
+				toggleYellowLed();
+				currentDist = measureDistance();
+				// check if shutter is rolled up to max distance
+				if(currentDist >= shutter_settings.maxDownDist) {
+					shutter_state = DOWN;
+					setPin(LEDRED, HIGH);
+					setPin(LEDYELLOW, LOW);
+					printf("%u:%u\n", SHUTTER, measureDistance());
+					SCHDeleteTask(PROCESS_ID);
+				}
+			}
+		}
+	};
+}
 
- void emulateRoll() {
-	 // emulate doing something
-	 for (uint8_t i = 0; i < 5;i++)
-	 {
-		 setPin(LEDYELLOW, HIGH);
-		 _delay_ms(500);
-		 setPin(LEDYELLOW, LOW);
-		 _delay_ms(500);
-	 }
- }
+// void emulateRoll() {
+// 	// emulate doing something
+// 	for (uint8_t i = 0; i < 5;i++)
+// 	{
+// 		setPin(LEDYELLOW, HIGH);
+// 		_delay_ms(500);
+// 		setPin(LEDYELLOW, LOW);
+// 		_delay_ms(500);
+// 	}
+// }
